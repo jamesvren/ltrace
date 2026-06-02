@@ -1,0 +1,332 @@
+//! Integration with the `log` crate.
+//!
+//! This module provides a [`LogWriter`] that implements the `log::Log` trait,
+//! allowing it to be set as the global logger. It supports dynamic log level
+//! changes at runtime using `log::LevelFilter`.
+//!
+//! The builder pattern supports two workflows:
+//!
+//! - **Chain `init()` directly on the builder** (recommended):
+//!   `LogWriterBuilder::new("app.log").rotation(Rotation::Daily).init()?`
+//! - **Separate build + init**: `init(LogWriterBuilder::new("app.log").build())?`
+
+use crate::config::{Compression, Rotation, RotationConfig, Timezone};
+use crate::rolling_writer::RollingWriter;
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
+
+/// Builder for creating a [`LogWriter`] and optionally initializing it as the global logger.
+pub struct LogWriterBuilder {
+    path: PathBuf,
+    config: RotationConfig,
+    level: log::LevelFilter,
+}
+
+impl LogWriterBuilder {
+    /// Create a new builder for the given log file path.
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            config: RotationConfig::default(),
+            level: log::LevelFilter::Info,
+        }
+    }
+
+    /// Set the time-based rotation frequency.
+    pub fn rotation(mut self, rotation: Rotation) -> Self {
+        self.config.rotation = rotation;
+        self
+    }
+
+    /// Set the maximum file size before rotation (in bytes).
+    pub fn max_file_size(mut self, size: u64) -> Self {
+        self.config.max_file_size = Some(size);
+        self
+    }
+
+    /// Set the maximum number of archived log files to keep.
+    pub fn max_files(mut self, max: usize) -> Self {
+        self.config.max_files = Some(max);
+        self
+    }
+
+    /// Set the compression mode for rotated files.
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.config.compression = compression;
+        self
+    }
+
+    /// Set the timezone for rotation timestamps and filenames.
+    /// Defaults to UTC.
+    pub fn timezone(mut self, timezone: Timezone) -> Self {
+        self.config.timezone = timezone;
+        self
+    }
+
+    /// Set the initial log level.
+    ///
+    /// This level is used both for the writer and for `log::set_max_level()`.
+    pub fn level(mut self, level: log::LevelFilter) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Build the [`LogWriter`] and register it as the global logger.
+    ///
+    /// This is the recommended way to initialize the logger. It combines
+    /// [`build`](Self::build) and [`init`] into a single call.
+    ///
+    /// Returns a [`LogHandle`] for dynamic level changes at runtime.
+    /// The handle is `Clone + Send + Sync`, so it can be moved to other threads.
+    pub fn init(self) -> io::Result<LogHandle> {
+        init(self.build())
+    }
+
+    /// Build the [`LogWriter`] without registering it.
+    ///
+    /// Use [`init`] to register it as the global logger, or use
+    /// `log::set_logger()` manually if you need more control.
+    pub fn build(self) -> LogWriter {
+        let rolling = RollingWriter::builder(&self.path)
+            .rotation(self.config.rotation)
+            .max_file_size(
+                self.config.max_file_size.unwrap_or(u64::MAX),
+            )
+            .max_files(self.config.max_files.unwrap_or(usize::MAX))
+            .compression(self.config.compression)
+            .timezone(self.config.timezone)
+            .build()
+            .expect("failed to create rolling writer");
+
+        let level = Arc::new(AtomicU8::new(level_to_u8(self.level)));
+
+        LogWriter {
+            writer: rolling,
+            level,
+            timezone: self.config.timezone,
+        }
+    }
+}
+
+fn level_to_u8(level: log::LevelFilter) -> u8 {
+    match level {
+        log::LevelFilter::Trace => 0,
+        log::LevelFilter::Debug => 1,
+        log::LevelFilter::Info => 2,
+        log::LevelFilter::Warn => 3,
+        log::LevelFilter::Error => 4,
+        log::LevelFilter::Off => 5,
+    }
+}
+
+fn u8_to_level(val: u8) -> log::LevelFilter {
+    match val {
+        0 => log::LevelFilter::Trace,
+        1 => log::LevelFilter::Debug,
+        2 => log::LevelFilter::Info,
+        3 => log::LevelFilter::Warn,
+        4 => log::LevelFilter::Error,
+        _ => log::LevelFilter::Off,
+    }
+}
+
+/// A logger that writes to rolling log files.
+///
+/// Implements `log::Log` so it can be set as the global logger via
+/// [`log::set_logger`]. Supports dynamic log level changes at runtime.
+///
+/// Typically constructed via [`LogWriterBuilder`].
+pub struct LogWriter {
+    writer: RollingWriter,
+    level: Arc<AtomicU8>,
+    timezone: Timezone,
+}
+
+impl LogWriter {
+    /// Create a new builder for the given log file path.
+    pub fn builder<P: AsRef<Path>>(path: P) -> LogWriterBuilder {
+        LogWriterBuilder::new(path)
+    }
+
+    /// Get a handle to dynamically change the log level.
+    ///
+    /// The handle shares ownership of the level via `Arc`, so it can be
+    /// cloned and sent across threads.
+    pub fn handle(&self) -> LogHandle {
+        LogHandle {
+            level: self.level.clone(),
+        }
+    }
+
+    /// Get the current log level.
+    pub fn max_level(&self) -> log::LevelFilter {
+        u8_to_level(self.level.load(Ordering::Relaxed))
+    }
+}
+
+impl log::Log for LogWriter {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= u8_to_level(self.level.load(Ordering::Relaxed))
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let level = match record.level() {
+            log::Level::Error => "ERROR",
+            log::Level::Warn => " WARN",
+            log::Level::Info => " INFO",
+            log::Level::Debug => "DEBUG",
+            log::Level::Trace => "TRACE",
+        };
+
+        let timestamp = self.timezone.now().format("%Y-%m-%dT%H:%M:%S%.6f");
+
+        let line = format!(
+            "{} {} {} {}\n",
+            timestamp,
+            level,
+            record.target(),
+            record.args(),
+        );
+
+        let _ = (&self.writer).write_all(line.as_bytes());
+    }
+
+    fn flush(&self) {
+        let _ = (&self.writer).flush();
+    }
+}
+
+/// A handle to dynamically change the log level of a [`LogWriter`].
+///
+/// This handle is backed by an `Arc<AtomicU8>`, so it is `Clone + Send + Sync`.
+/// You can clone it and move the clone to other threads for runtime level changes.
+#[derive(Clone)]
+pub struct LogHandle {
+    level: Arc<AtomicU8>,
+}
+
+impl LogHandle {
+    /// Set the log level.
+    pub fn set_level(&self, level: log::LevelFilter) {
+        self.level.store(level_to_u8(level), Ordering::Relaxed);
+    }
+
+    /// Get the current log level.
+    pub fn get_level(&self) -> log::LevelFilter {
+        u8_to_level(self.level.load(Ordering::Relaxed))
+    }
+}
+
+/// Initialize the global logger with a [`LogWriter`].
+///
+/// Sets the given writer as the global logger. The initial log level
+/// is taken from the writer's configured level (set via [`LogWriterBuilder::level`]).
+/// Returns a [`LogHandle`] for dynamic level changes at runtime.
+///
+/// In most cases, you should prefer [`LogWriterBuilder::init`] which combines
+/// building and initialization in one call.
+pub fn init(writer: LogWriter) -> io::Result<LogHandle> {
+    let initial_level = writer.max_level();
+
+    // Clone the Arc before moving writer into the Box, so we can return it.
+    let level = writer.level.clone();
+
+    let boxed = Box::new(writer);
+
+    log::set_max_level(initial_level);
+
+    log::set_boxed_logger(boxed)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    // Ensure the level stored in the writer matches what we set globally.
+    level.store(level_to_u8(initial_level), Ordering::Relaxed);
+
+    Ok(LogHandle { level })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::Log;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_log_writer_builder() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = LogWriterBuilder::new(&path)
+            .rotation(Rotation::Never)
+            .max_file_size(1024)
+            .max_files(3)
+            .level(log::LevelFilter::Debug)
+            .build();
+
+        assert_eq!(writer.max_level(), log::LevelFilter::Debug);
+
+        let handle = writer.handle();
+        handle.set_level(log::LevelFilter::Trace);
+        assert_eq!(handle.get_level(), log::LevelFilter::Trace);
+    }
+
+    #[test]
+    fn test_log_writer_log_trait() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = LogWriterBuilder::new(&path)
+            .rotation(Rotation::Never)
+            .level(log::LevelFilter::Info)
+            .build();
+
+        assert!(writer.enabled(&log::Record::builder()
+            .level(log::Level::Info)
+            .target("test")
+            .build()
+            .metadata()));
+
+        assert!(!writer.enabled(&log::Record::builder()
+            .level(log::Level::Debug)
+            .target("test")
+            .build()
+            .metadata()));
+
+        let handle = writer.handle();
+        handle.set_level(log::LevelFilter::Debug);
+        assert!(writer.enabled(&log::Record::builder()
+            .level(log::Level::Debug)
+            .target("test")
+            .build()
+            .metadata()));
+    }
+
+    #[test]
+    fn test_log_handle_is_clone_send_sync() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = LogWriterBuilder::new(&path)
+            .rotation(Rotation::Never)
+            .level(log::LevelFilter::Info)
+            .build();
+
+        let handle = writer.handle();
+        let handle2 = handle.clone();
+
+        // Verify Send + Sync (compile-time check).
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<LogHandle>();
+        assert_sync::<LogHandle>();
+
+        // Verify clone shares the same level.
+        handle2.set_level(log::LevelFilter::Debug);
+        assert_eq!(handle.get_level(), log::LevelFilter::Debug);
+    }
+}
