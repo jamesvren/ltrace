@@ -3,7 +3,7 @@
 //! This crate provides a high-performance rolling file writer with:
 //!
 //! - **Log rotation by time**: MINUTELY, HOURLY, DAILY
-//! - **Log rotation by size**: configurable max file size
+//! - **Log rotation by size**: configurable max file size (independent of time rotation)
 //! - **Time + size combined rotation**: even when using time-based rotation (e.g. Daily),
 //!   a size limit still triggers additional rotations within that window (e.g., multiple
 //!   rotations per day if the log exceeds the size threshold)
@@ -11,20 +11,20 @@
 //!   performed on a background thread so it does not block writes
 //! - **Max file count**: automatically prune old log files
 //! - **Dynamic log level**: change the `log` crate log level at runtime via [`log_layer::LogHandle`]
+//! - **Timezone configuration**: UTC (default) or local timezone for rotation timestamps
 //! - **Auto-create directories**: parent directories are created automatically if they don't exist
 //!
 //! ## Rotated file naming
 //!
-//! Rotated files include a microsecond timestamp and a sequence number to guarantee uniqueness
-//! even when multiple rotations occur within the same time window (e.g., size-triggered rotations
-//! within the same minute or day):
+//! Rotated filenames use a nanosecond-precision timestamp (nanoseconds since UNIX epoch)
+//! to guarantee strict ordering and uniqueness, with an optional date prefix:
 //!
-//! - Daily rotation: `app.log.2024-01-15-123456-001`
-//! - Hourly rotation: `app.log.2024-01-15-14-123456-001`
-//! - Minutely rotation: `app.log.2024-01-15-14-30-123456-001`
-//! - No rotation: `app.log.1705312256-123456-001`
+//! - Daily rotation: `app.log.2024-01-15T1780358400000000000`
+//! - Hourly rotation: `app.log.2024-01-15-14T1780358400000000000`
+//! - Minutely rotation: `app.log.2024-01-15-14-30T1780358400000000000`
+//! - Size-only (Never): `app.log.1780358400000000000`
 //!
-//! With gzip compression enabled: `app.log.2024-01-15-123456-001.gz`
+//! With gzip compression enabled: `app.log.2024-01-15T1780358400000000000.gz`
 //!
 //! # Using with `tracing`
 //!
@@ -43,10 +43,12 @@
 //!     .unwrap();
 //!
 //! let (non_blocking, _guard) = tracing_appender::non_blocking(writer);
-//! let subscriber = tracing_subscriber::fmt()
+//! tracing_subscriber::fmt()
+//!     .with_ansi(false)
 //!     .with_writer(non_blocking)
-//!     .finish();
-//! tracing::subscriber::set_global_default(subscriber)?;
+//!     .finish()
+//!     .try_init()
+//!     .unwrap();
 //! ```
 //!
 //! # Using with `log`

@@ -17,8 +17,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::Timelike;
-
 /// Internal shared state of a `RollingWriter`.
 struct RollingWriterInner {
     /// Path to the current log file.
@@ -31,8 +29,6 @@ struct RollingWriterInner {
     current_size: u64,
     /// When the next time-based rotation should occur.
     next_time_rotation: chrono::DateTime<chrono::FixedOffset>,
-    /// Monotonically increasing counter for same-second disambiguation.
-    rotation_seq: u64,
 }
 
 /// A `std::io::Write` implementation that writes to a log file with
@@ -55,86 +51,76 @@ impl RollingWriter {
 
     /// Rotate the current log file and open a new one.
     fn rotate(&self) -> io::Result<()> {
-        let mut inner = self.inner();
+        let inner = self.inner();
         let path = inner.base_path.clone();
         let config = inner.config.clone();
-        let seq = inner.rotation_seq;
 
         // Determine the timestamp suffix for the rotated file.
-        // Append "-{seq}" to guarantee uniqueness even when multiple rotations
-        // occur within the same microsecond (e.g., rapid size-triggered rotations).
+        // Use nanoseconds since UNIX epoch (monotonically increasing) instead of
+        // nanosecond() (0-999999999 which can wrap around and cause incorrect sort order).
         let now = config.timezone.now();
+        let nanos = now
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| now.timestamp_millis());
         let suffix = config.rotation.suffix_format();
         let timestamp = if suffix.is_empty() {
-            format!(
-                "{}-{:06}-{:03}",
-                now.timestamp(),
-                now.nanosecond() / 1000,
-                seq
-            )
+            format!("{:019}", nanos)
         } else {
-            format!(
-                "{}-{:06}-{:03}",
-                now.format(suffix),
-                now.nanosecond() / 1000,
-                seq
-            )
+            format!("{}T{:019}", now.format(suffix), nanos)
         };
 
-        // Build the rotated path: "app.log.2024-01-15-123456"
-        // The microsecond suffix avoids collisions when multiple rotations
-        // happen within the same time window (e.g., size-triggered rotations
-        // within the same day).
         let rotated_path = path.with_file_name(format!(
             "{}.{}",
             path.file_name().expect("has filename").to_string_lossy(),
             timestamp
         ));
 
-        inner.rotation_seq += 1;
         drop(inner);
 
         // Rename the current file to the rotated path.
         if let Err(e) = fs::rename(&path, &rotated_path) {
-            // If the file doesn't exist yet (first write), that's fine.
-            if e.kind() != io::ErrorKind::NotFound {
+            if e.kind() == io::ErrorKind::NotFound {
+                // First write after open: file may not exist yet.
+            } else {
                 return Err(e);
             }
-        } else {
-            // Compress if gzip is configured.
-            let should_compress = config.compression == Compression::Gzip;
+        }
 
-            if should_compress {
-                #[cfg(feature = "compression")]
-                {
-                    let gz_path = PathBuf::from(format!("{}.gz", rotated_path.display()));
-                    let rotated_clone = rotated_path.clone();
-                    std::thread::Builder::new()
-                        .name(format!("ltrace-gz-{:04}", seq % 10000))
-                        .spawn(move || match compress_file(&rotated_clone, &gz_path) {
-                            Ok(_) => fs::remove_file(&rotated_clone).ok(),
-                            Err(e) => {
-                                eprintln!(
-                                    "ltrace: failed to compress {}: {}",
-                                    rotated_clone.display(),
-                                    e
-                                );
-                                None
+        // Compress and prune in the background thread, after compression.
+        if config.compression == Compression::Gzip {
+            #[cfg(feature = "compression")]
+            {
+                let gz_path = PathBuf::from(format!("{}.gz", rotated_path.display()));
+                let rotated_clone = rotated_path.clone();
+                let base_path_clone = path.clone();
+                let max_files = config.max_files;
+                let prune_config = config.clone();
+                std::thread::Builder::new()
+                    .spawn(move || {
+                        match compress_file(&rotated_clone, &gz_path) {
+                            Ok(_) => {
+                                let _ = fs::remove_file(&rotated_clone);
                             }
-                        })
-                        .map_err(|e| eprintln!("ltrace: failed to spawn compress thread: {e}"))
-                        .ok();
-                }
-                #[cfg(not(feature = "compression"))]
-                {
-                    let _ = rotated_path;
-                }
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                                // Already pruned by another rotation.
+                            }
+                            Err(_) => {}
+                        }
+                        // Prune AFTER compression completes, so .gz files are
+                        // visible and deduplication works correctly.
+                        if let Some(max) = max_files {
+                            prune_old_files(&base_path_clone, max, &prune_config);
+                        }
+                    })
+                    .ok();
             }
-
-            // Enforce max file count.
-            if let Some(max) = config.max_files {
-                prune_old_files(&path, max, &config);
+            #[cfg(not(feature = "compression"))]
+            {
+                let _ = rotated_path;
             }
+        } else if let Some(max) = config.max_files {
+            // No compression: prune immediately.
+            prune_old_files(&path, max, &config);
         }
 
         // Reopen the current file.
@@ -174,11 +160,6 @@ impl RollingWriter {
             self.rotate()?;
         }
         Ok(())
-    }
-
-    /// Returns the current file size in bytes.
-    pub fn current_size(&self) -> u64 {
-        self.inner().current_size
     }
 }
 
@@ -274,6 +255,7 @@ impl RollingWriterBuilder {
         }
 
         let file = open_log_file(&self.path)?;
+        let current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         let next_time_rotation = self
             .config
             .rotation
@@ -284,9 +266,8 @@ impl RollingWriterBuilder {
                 base_path: self.path,
                 config: self.config,
                 current_file: file,
-                current_size: 0,
+                current_size,
                 next_time_rotation,
-                rotation_seq: 0,
             }),
         })
     }
@@ -309,7 +290,7 @@ fn prune_old_files(base_path: &Path, max_files: usize, config: &RotationConfig) 
 
     let prefix = format!("{}.", base_name);
 
-    let mut archives: Vec<(PathBuf, i64)> = Vec::new();
+    let mut archives: Vec<(PathBuf, i64, String)> = Vec::new();
 
     let entries = match fs::read_dir(&parent) {
         Ok(e) => e,
@@ -326,59 +307,75 @@ fn prune_old_files(base_path: &Path, max_files: usize, config: &RotationConfig) 
         let ts_str = suffix.strip_suffix(".gz").unwrap_or(suffix);
 
         if let Some(ts) = parse_timestamp(ts_str, config.rotation) {
-            archives.push((entry.path(), ts));
+            let nano_key = extract_nano_key(ts_str);
+            archives.push((entry.path(), ts, nano_key));
         }
     }
+
+    // When both a compressed (.gz) and uncompressed version of the same
+    // rotation exist (compression in progress), only count the .gz file.
+    let gz_keys: std::collections::HashSet<String> = archives
+        .iter()
+        .filter(|(_, _, key)| key.ends_with(".gz") || !key.is_empty())
+        .filter_map(|(path, _, key)| {
+            if path.extension().is_some_and(|e| e == "gz") {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    archives.retain(|(path, _, key)| {
+        if path.extension().is_some_and(|e| e == "gz") {
+            true
+        } else {
+            // Keep uncompressed file only if no matching .gz exists.
+            !gz_keys.contains(key)
+        }
+    });
 
     // Sort newest first.
     archives.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for (path, _) in archives.iter().skip(max_files) {
-        fs::remove_file(path).ok();
+    let to_delete: Vec<_> = archives.iter().skip(max_files).cloned().collect();
+    if to_delete.is_empty() {
+        return;
     }
+
+    for (path, _, _) in &to_delete {
+        if let Err(e) = fs::remove_file(path) {
+            let _ = e;
+        }
+    }
+}
+
+/// Extract a key from a timestamp suffix for deduplicating
+/// uncompressed files with their compressed (.gz) counterparts.
+fn extract_nano_key(ts_str: &str) -> String {
+    // Use the full timestamp string as the key.
+    // Uncompressed and .gz files share the same base name.
+    ts_str.to_string()
 }
 
 /// Parse the timestamp from a rotated filename.
 ///
-/// Filenames include a microsecond suffix and a seq number
-/// (e.g. `app.log.2024-01-15-123456-001`), so we strip the trailing
-/// `-NNNNNN-NNN` before parsing the date part.
+/// For time-based rotation, filenames use the format
+/// `{rotation_suffix}T{nanos_since_epoch:019}` (e.g. `app.log.2024-01-15T1780358400000000000`).
+/// For size-only rotation (Never), filenames use the full nanoseconds since epoch.
 fn parse_timestamp(s: &str, rotation: Rotation) -> Option<i64> {
-    // The suffix is "-{micros:6}-{seq:3}". Strip the last 4 chars ("-NNN") for seq.
-    let last_dash = s.rfind('-')?;
-    if s.len() - last_dash - 1 != 3 {
-        return s.parse::<i64>().ok();
-    }
-    let micros_str = &s[..last_dash];
-
-    // Now strip the last 4 chars ("-NNNNNN") for microseconds.
-    let second_last_dash = micros_str.rfind('-')?;
-    let seq_micros = &micros_str[second_last_dash + 1..];
-    if seq_micros.len() != 6 || !seq_micros.chars().all(|c| c.is_ascii_digit()) {
+    // For Never rotation, the filename is just the full nanoseconds since epoch.
+    if matches!(rotation, Rotation::Never) {
         return s.parse::<i64>().ok();
     }
 
-    let date_part = &micros_str[..second_last_dash];
-
-    let naive: chrono::NaiveDateTime = match rotation {
-        Rotation::Minutely => {
-            chrono::NaiveDateTime::parse_from_str(date_part, "%Y-%m-%d-%H-%M").ok()?
-        }
-        Rotation::Hourly => {
-            let date = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d-%H").ok()?;
-            chrono::NaiveDateTime::new(date, chrono::NaiveTime::MIN)
-        }
-        Rotation::Daily => {
-            let date = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()?;
-            chrono::NaiveDateTime::new(date, chrono::NaiveTime::MIN)
-        }
-        Rotation::Never => {
-            let base = date_part.parse::<i64>().ok()?;
-            let micros: u32 = seq_micros.parse().unwrap_or(0);
-            return Some(base * 1_000_000 + micros as i64);
-        }
-    };
-    Some(naive.and_utc().timestamp())
+    // Time-based rotation: "{rotation_suffix}T{nanos_since_epoch:019}"
+    let t_pos = s.rfind('T')?;
+    let nano_part = &s[t_pos + 1..];
+    if nano_part.len() != 19 || !nano_part.chars().all(|c| c.is_ascii_digit()) {
+        return s.parse::<i64>().ok();
+    }
+    nano_part.parse::<i64>().ok()
 }
 
 #[cfg(feature = "compression")]
@@ -409,7 +406,7 @@ mod tests {
         write!(writer, "hello ").unwrap();
         write!(writer, "world\n").unwrap();
         writer.flush().unwrap();
-        assert_eq!(writer.current_size(), 12);
+        assert_eq!(writer.inner().current_size, 12);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello world\n");
     }

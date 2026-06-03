@@ -4,11 +4,16 @@
 //! allowing it to be set as the global logger. It supports dynamic log level
 //! changes at runtime using `log::LevelFilter`.
 //!
-//! The builder pattern supports two workflows:
+//! The recommended approach is to chain `init()` directly on the builder:
 //!
-//! - **Chain `init()` directly on the builder** (recommended):
-//!   `LogWriterBuilder::new("app.log").rotation(Rotation::Daily).init()?`
-//! - **Separate build + init**: `init(LogWriterBuilder::new("app.log").build())?`
+//! ```ignore
+//! use ltrace::log_layer::LogWriterBuilder;
+//!
+//! let handle = LogWriterBuilder::new("app.log")
+//!     .rotation(ltrace::Rotation::Daily)
+//!     .level(log::LevelFilter::Info)
+//!     .init()?;
+//! ```
 
 use crate::config::{Compression, Rotation, RotationConfig, Timezone};
 use crate::rolling_writer::RollingWriter;
@@ -16,8 +21,8 @@ use crate::rolling_writer::RollingWriter;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
     Arc,
+    atomic::{AtomicU8, Ordering},
 };
 
 /// Builder for creating a [`LogWriter`] and optionally initializing it as the global logger.
@@ -79,37 +84,42 @@ impl LogWriterBuilder {
     /// Build the [`LogWriter`] and register it as the global logger.
     ///
     /// This is the recommended way to initialize the logger. It combines
-    /// [`build`](Self::build) and [`init`] into a single call.
+    /// [`build`](Self::build) and [`init`](Self::init) into a single call.
     ///
     /// Returns a [`LogHandle`] for dynamic level changes at runtime.
     /// The handle is `Clone + Send + Sync`, so it can be moved to other threads.
     pub fn init(self) -> io::Result<LogHandle> {
-        init(self.build())
+        self::init(self.build()?)
     }
 
     /// Build the [`LogWriter`] without registering it.
     ///
-    /// Use [`init`] to register it as the global logger, or use
-    /// `log::set_logger()` manually if you need more control.
-    pub fn build(self) -> LogWriter {
-        let rolling = RollingWriter::builder(&self.path)
+    /// If the log file's parent directory doesn't exist, it will be created
+    /// automatically. Returns an error if the directory cannot be created or
+    /// the log file cannot be opened.
+    ///
+    /// Use [`LogWriterBuilder::init`] to register as the global logger and
+    /// get a [`LogHandle`] for dynamic level changes.
+    pub fn build(self) -> io::Result<LogWriter> {
+        let mut builder = RollingWriter::builder(&self.path)
             .rotation(self.config.rotation)
-            .max_file_size(
-                self.config.max_file_size.unwrap_or(u64::MAX),
-            )
-            .max_files(self.config.max_files.unwrap_or(usize::MAX))
             .compression(self.config.compression)
-            .timezone(self.config.timezone)
-            .build()
-            .expect("failed to create rolling writer");
+            .timezone(self.config.timezone);
+        if let Some(size) = self.config.max_file_size {
+            builder = builder.max_file_size(size);
+        }
+        if let Some(max) = self.config.max_files {
+            builder = builder.max_files(max);
+        }
+        let rolling = builder.build()?;
 
         let level = Arc::new(AtomicU8::new(level_to_u8(self.level)));
 
-        LogWriter {
+        Ok(LogWriter {
             writer: rolling,
             level,
             timezone: self.config.timezone,
-        }
+        })
     }
 }
 
@@ -234,7 +244,7 @@ impl LogHandle {
 ///
 /// In most cases, you should prefer [`LogWriterBuilder::init`] which combines
 /// building and initialization in one call.
-pub fn init(writer: LogWriter) -> io::Result<LogHandle> {
+pub(crate) fn init(writer: LogWriter) -> io::Result<LogHandle> {
     let initial_level = writer.max_level();
 
     // Clone the Arc before moving writer into the Box, so we can return it.
@@ -244,8 +254,7 @@ pub fn init(writer: LogWriter) -> io::Result<LogHandle> {
 
     log::set_max_level(initial_level);
 
-    log::set_boxed_logger(boxed)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    log::set_boxed_logger(boxed).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     // Ensure the level stored in the writer matches what we set globally.
     level.store(level_to_u8(initial_level), Ordering::Relaxed);
@@ -260,7 +269,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_log_writer_builder() {
+    fn test_log_writer_builder() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
         let writer = LogWriterBuilder::new(&path)
@@ -268,53 +277,66 @@ mod tests {
             .max_file_size(1024)
             .max_files(3)
             .level(log::LevelFilter::Debug)
-            .build();
-
+            .build()?;
         assert_eq!(writer.max_level(), log::LevelFilter::Debug);
 
         let handle = writer.handle();
         handle.set_level(log::LevelFilter::Trace);
         assert_eq!(handle.get_level(), log::LevelFilter::Trace);
+        Ok(())
     }
 
     #[test]
-    fn test_log_writer_log_trait() {
+    fn test_log_writer_log_trait() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
         let writer = LogWriterBuilder::new(&path)
             .rotation(Rotation::Never)
             .level(log::LevelFilter::Info)
-            .build();
+            .build()?;
 
-        assert!(writer.enabled(&log::Record::builder()
-            .level(log::Level::Info)
-            .target("test")
-            .build()
-            .metadata()));
+        assert!(
+            writer.enabled(
+                &log::Record::builder()
+                    .level(log::Level::Info)
+                    .target("test")
+                    .build()
+                    .metadata()
+            )
+        );
 
-        assert!(!writer.enabled(&log::Record::builder()
-            .level(log::Level::Debug)
-            .target("test")
-            .build()
-            .metadata()));
+        assert!(
+            !writer.enabled(
+                &log::Record::builder()
+                    .level(log::Level::Debug)
+                    .target("test")
+                    .build()
+                    .metadata()
+            )
+        );
 
         let handle = writer.handle();
         handle.set_level(log::LevelFilter::Debug);
-        assert!(writer.enabled(&log::Record::builder()
-            .level(log::Level::Debug)
-            .target("test")
-            .build()
-            .metadata()));
+        assert!(
+            writer.enabled(
+                &log::Record::builder()
+                    .level(log::Level::Debug)
+                    .target("test")
+                    .build()
+                    .metadata()
+            )
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_log_handle_is_clone_send_sync() {
+    fn test_log_handle_is_clone_send_sync() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
         let writer = LogWriterBuilder::new(&path)
             .rotation(Rotation::Never)
             .level(log::LevelFilter::Info)
-            .build();
+            .build()?;
 
         let handle = writer.handle();
         let handle2 = handle.clone();
@@ -328,5 +350,6 @@ mod tests {
         // Verify clone shares the same level.
         handle2.set_level(log::LevelFilter::Debug);
         assert_eq!(handle.get_level(), log::LevelFilter::Debug);
+        Ok(())
     }
 }
