@@ -1,6 +1,6 @@
 # ltrace
 
-> A high-performance rolling file writer for `tracing` and `log` crates with rotation, compression, and dynamic log level support.
+> A high-performance rolling file writer and multi-target logger for `tracing` and `log` crates with rotation, compression, dynamic log levels, console output, and multi-target support.
 
 [![crates.io](https://img.shields.io/crates/v/ltrace.svg)](https://crates.io/crates/ltrace)
 [![docs.rs](https://docs.rs/ltrace/badge.svg)](https://docs.rs/ltrace)
@@ -13,7 +13,9 @@
 - **Time + size combined** — size limits can trigger additional rotations within a time window
 - **Gzip compression** — rotated files can be compressed on a background thread (zero blocking)
 - **Auto prune** — automatically remove old log files when max count is exceeded
-- **Dynamic log level** — change the `log` crate log level at runtime via `LogHandle`
+- **Dynamic log level** — change the log level at runtime via `LogHandle` (`Clone + Send + Sync`)
+- **Console output** — colored terminal logging with ANSI colors (feature `console`)
+- **Multi-target logging** — combine console + file, or any number of writers together
 - **Timezone support** — UTC (default) or local timezone for rotation timestamps
 - **Auto-create directories** — parent directories created automatically
 
@@ -30,8 +32,16 @@ ltrace = "0.1"
 
 | Feature      | Default | Description                              |
 |------------- |---------|------------------------------------------|
-| `log`        | ✅      | Enable `log` crate support                |
+| `log`        | ✅      | Enable `log` crate support               |
 | `compression`| ✅      | Enable gzip compression (requires `flate2`) |
+| `console`    | ❌      | Enable colored console output (requires `colored`) |
+
+To enable console support:
+
+```toml
+[dependencies]
+ltrace = { version = "0.1", features = ["log", "console"] }
+```
 
 To disable default features:
 
@@ -57,8 +67,7 @@ let writer = RollingWriter::builder("/var/log/myapp/app.log")
     .build()?;
 
 let (non_blocking, _guard) = tracing_appender::non_blocking(writer);
-tracing_subscriber::fmt()
-    .with_ansi(false)
+let subscriber = tracing_subscriber::fmt()
     .with_writer(non_blocking)
     .finish()
     .try_init()?;
@@ -66,19 +75,86 @@ tracing_subscriber::fmt()
 
 ### With `log` crate
 
-Chain `init()` directly on the builder for a clean one-liner:
+Simple initialization with defaults (Daily rotation, Info level):
 
 ```rust
-use ltrace::log_layer::LogWriterBuilder;
-use ltrace::{Rotation, Compression};
+use ltrace::LogWriter;
 
-let handle = LogWriterBuilder::new("/var/log/myapp/app.log")
+let handle = LogWriter::init("/var/log/myapp/app.log")?;
+
+// Dynamically change level at runtime:
+handle.set_level(log::LevelFilter::Debug);
+```
+
+Full builder configuration:
+
+```rust
+use ltrace::{LogWriter, Rotation, Compression};
+
+let handle = LogWriter::builder("/var/log/myapp/app.log")
     .rotation(Rotation::Daily)
-    .max_file_size(10 * 1024 * 1024)  // optional: rotate within the same day if size exceeded
+    .max_file_size(10 * 1024 * 1024)  // also rotate within the same day if size exceeded
     .max_files(5)
     .compression(Compression::Gzip)
     .level(log::LevelFilter::Info)
     .init()?;
+```
+
+### Console output (feature `console`)
+
+Output colored logs to the terminal:
+
+```rust
+use ltrace::ConsoleWriter;
+
+let handle = ConsoleWriter::builder()
+    .level(log::LevelFilter::Debug)
+    .init()?;
+```
+
+Colors by level:
+- **ERROR**: bold red
+- **WARN**: yellow
+- **INFO**: green
+- **DEBUG**: cyan
+- **TRACE**: dimmed / bright black
+
+Error and warning messages go to stderr; info, debug, and trace go to stdout.
+
+### Multi-target output (console + file)
+
+Combine multiple writers to log to both console and file simultaneously:
+
+```rust
+use ltrace::{MultiLog, ConsoleWriter, LogWriter, Rotation, Compression};
+
+let multi = MultiLog::new()
+    .writer(ConsoleWriter::builder()
+        .level(log::LevelFilter::Info)
+        .build()?)
+    .writer(LogWriter::builder("/var/log/myapp/app.log")
+        .rotation(Rotation::Daily)
+        .compression(Compression::Gzip)
+        .level(log::LevelFilter::Debug)
+        .build()?)
+    .init()?;
+```
+
+### Per-writer dynamic level control
+
+Adjust each writer's log level independently at runtime:
+
+```rust
+use ltrace::{MultiLog, ConsoleWriter, LogWriter};
+
+let (multi, handles) = MultiLog::new()
+    .writer_with_handle(ConsoleWriter::builder().build()?)
+    .writer_with_handle(LogWriter::builder("app.log").build()?)
+    .build_with_handles()?;
+
+// Adjust each writer's level independently:
+handles[0].set_level(log::LevelFilter::Warn);   // console: only warn+
+handles[1].set_level(log::LevelFilter::Debug);  // file: debug+
 ```
 
 ## Configuration
@@ -132,14 +208,12 @@ RollingWriter::builder("app.log")
     .build()?;
 ```
 
-## Dynamic Log Level (log crate only)
+## Dynamic Log Level
 
 `LogHandle` is `Clone + Send + Sync`, so you can move it to other threads:
 
 ```rust
-let handle = LogWriterBuilder::new("app.log")
-    .level(log::LevelFilter::Info)
-    .init()?;
+let handle = LogWriter::init("app.log")?;
 
 // Spawn a thread to listen for signals
 let h = handle.clone();
@@ -167,23 +241,31 @@ With gzip compression: `app.log.2024-01-15T1780358400000000000.gz`
 
 ## API Overview
 
-| Type / Module | Description |
-|---------------|-------------|
+| Type | Description |
+|------|-------------|
 | [`RollingWriter`] | Core rolling file writer, implements `std::io::Write` |
 | [`Rotation`] | Time-based rotation frequency enum |
-| [`Compression`] | Compression mode (None / Gzip) |
+| [`Compression`] | Compression mode (None / Gzip, requires `compression` feature) |
 | [`Timezone`] | UTC or Local timezone for timestamps |
-| [`log_layer::LogWriterBuilder`] | Builder for `log` crate integration |
-| [`log_layer::LogWriter`] | Implements `log::Log` for the global logger |
-| [`log_layer::LogHandle`] | Cloneable handle for dynamic level changes |
+| [`LogWriter`] | Implements `log::Log` for rolling file logging |
+| [`LogWriterBuilder`] | Builder for `LogWriter` |
+| [`ConsoleWriter`] | Colored terminal logger (requires `console` feature) |
+| [`ConsoleWriterBuilder`] | Builder for `ConsoleWriter` |
+| [`MultiLog`] | Multi-target log dispatcher, combines multiple writers |
+| [`LogHandle`] | Cloneable handle for dynamic level changes |
+| [`MultiHandle`] | Handle for multi-log management with per-writer access |
 
 [`RollingWriter`]: https://docs.rs/ltrace/latest/ltrace/struct.RollingWriter.html
 [`Rotation`]: https://docs.rs/ltrace/latest/ltrace/enum.Rotation.html
 [`Compression`]: https://docs.rs/ltrace/latest/ltrace/enum.Compression.html
 [`Timezone`]: https://docs.rs/ltrace/latest/ltrace/enum.Timezone.html
-[`log_layer::LogWriterBuilder`]: https://docs.rs/ltrace/latest/ltrace/log_layer/struct.LogWriterBuilder.html
-[`log_layer::LogWriter`]: https://docs.rs/ltrace/latest/ltrace/log_layer/struct.LogWriter.html
-[`log_layer::LogHandle`]: https://docs.rs/ltrace/latest/ltrace/log_layer/struct.LogHandle.html
+[`LogWriter`]: https://docs.rs/ltrace/latest/ltrace/struct.LogWriter.html
+[`LogWriterBuilder`]: https://docs.rs/ltrace/latest/ltrace/struct.LogWriterBuilder.html
+[`ConsoleWriter`]: https://docs.rs/ltrace/latest/ltrace/struct.ConsoleWriter.html
+[`ConsoleWriterBuilder`]: https://docs.rs/ltrace/latest/ltrace/struct.ConsoleWriterBuilder.html
+[`MultiLog`]: https://docs.rs/ltrace/latest/ltrace/struct.MultiLog.html
+[`LogHandle`]: https://docs.rs/ltrace/latest/ltrace/struct.LogHandle.html
+[`MultiHandle`]: https://docs.rs/ltrace/latest/ltrace/struct.MultiHandle.html
 
 ## License
 

@@ -30,7 +30,7 @@ jobs:
     - name: BuildLog
       run: cargo build --no-default-features -F log --verbose
     - name: BuildCompress
-      run: cargo build --no-default-features -F compress --verbose
+      run: cargo build --no-default-features -F compression --verbose
     - name: BuildConsole
       run: cargo build --no-default-features -F console --verbose
     - name: Run tests
