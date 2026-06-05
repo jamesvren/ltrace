@@ -197,7 +197,10 @@ impl log::Log for LogWriter {
             log::Level::Trace => "TRACE",
         };
 
-        let timestamp = self.timezone.now().format("%Y-%m-%dT%H:%M:%S%.6f");
+        let timestamp = self
+            .timezone
+            .now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
         let line = format!(
             "{} {} {} {}\n",
