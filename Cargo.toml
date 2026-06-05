@@ -1,6 +1,6 @@
 [package]
 name = "ltrace"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["James Ren <jamesvren@163.com>"]
 repository = "https://github.com/jamesvren/ltrace"
