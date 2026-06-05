@@ -19,7 +19,10 @@ pub enum Rotation {
 
 impl Rotation {
     /// Returns the next rotation instant after `now` for this rotation frequency.
-    pub fn next_rotation(&self, now: chrono::DateTime<chrono::FixedOffset>) -> chrono::DateTime<chrono::FixedOffset> {
+    pub fn next_rotation(
+        &self,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) -> chrono::DateTime<chrono::FixedOffset> {
         match self {
             Rotation::Minutely => {
                 let dt = now + chrono::Duration::minutes(1);
@@ -63,15 +66,17 @@ impl fmt::Display for Rotation {
 }
 
 /// Compression mode for rotated log files.
+#[cfg(feature = "compression")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
-    /// Gzip compression.
+    /// Gzip compression (requires the `compression` feature).
     #[default]
     Gzip,
     /// No compression.
     None,
 }
 
+#[cfg(feature = "compression")]
 impl Compression {
     /// Returns the file extension for this compression type.
     pub const fn extension(&self) -> &'static str {
@@ -124,6 +129,8 @@ pub struct RotationConfig {
     /// `None` means unlimited.
     pub max_files: Option<usize>,
     /// Compression mode for rotated files.
+    //#[allow(dead_code)]
+    #[cfg(feature = "compression")]
     pub compression: Compression,
     /// Timezone for rotation timestamps and filenames.
     pub timezone: Timezone,
@@ -135,7 +142,8 @@ impl Default for RotationConfig {
             rotation: Rotation::Daily,
             max_file_size: None,
             max_files: None,
-            compression: Compression::None,
+            #[cfg(feature = "compression")]
+            compression: Compression::Gzip,
             timezone: Timezone::default(),
         }
     }

@@ -4,26 +4,36 @@
 //! allowing it to be set as the global logger. It supports dynamic log level
 //! changes at runtime using `log::LevelFilter`.
 //!
-//! The recommended approach is to chain `init()` directly on the builder:
+//! The recommended approach is to call [`LogWriter::init`] directly:
 //!
 //! ```ignore
-//! use ltrace::log_layer::LogWriterBuilder;
+//! use ltrace::LogWriter;
 //!
-//! let handle = LogWriterBuilder::new("app.log")
-//!     .rotation(ltrace::Rotation::Daily)
+//! let handle = LogWriter::init("app.log")?;
+//! ```
+//!
+//! Or use the builder for full configuration:
+//!
+//! ```ignore
+//! use ltrace::{LogWriter, Rotation};
+//!
+//! let handle = LogWriter::builder("app.log")
+//!     .rotation(Rotation::Daily)
 //!     .level(log::LevelFilter::Info)
 //!     .init()?;
 //! ```
 
-use crate::config::{Compression, Rotation, RotationConfig, Timezone};
+#[cfg(feature = "compression")]
+use crate::config::Compression;
+use crate::config::{Rotation, RotationConfig, Timezone};
+use crate::handle;
 use crate::rolling_writer::RollingWriter;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, Ordering},
-};
+use std::sync::Arc;
+
+pub use handle::LogHandle;
 
 /// Builder for creating a [`LogWriter`] and optionally initializing it as the global logger.
 pub struct LogWriterBuilder {
@@ -61,6 +71,7 @@ impl LogWriterBuilder {
     }
 
     /// Set the compression mode for rotated files.
+    #[cfg(feature = "compression")]
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;
         self
@@ -101,9 +112,14 @@ impl LogWriterBuilder {
     /// Use [`LogWriterBuilder::init`] to register as the global logger and
     /// get a [`LogHandle`] for dynamic level changes.
     pub fn build(self) -> io::Result<LogWriter> {
+        #[cfg(feature = "compression")]
         let mut builder = RollingWriter::builder(&self.path)
             .rotation(self.config.rotation)
             .compression(self.config.compression)
+            .timezone(self.config.timezone);
+        #[cfg(not(feature = "compression"))]
+        let mut builder = RollingWriter::builder(&self.path)
+            .rotation(self.config.rotation)
             .timezone(self.config.timezone);
         if let Some(size) = self.config.max_file_size {
             builder = builder.max_file_size(size);
@@ -113,35 +129,15 @@ impl LogWriterBuilder {
         }
         let rolling = builder.build()?;
 
-        let level = Arc::new(AtomicU8::new(level_to_u8(self.level)));
+        let level = Arc::new(std::sync::atomic::AtomicU8::new(
+            handle::level_to_u8(self.level),
+        ));
 
         Ok(LogWriter {
             writer: rolling,
             level,
             timezone: self.config.timezone,
         })
-    }
-}
-
-fn level_to_u8(level: log::LevelFilter) -> u8 {
-    match level {
-        log::LevelFilter::Trace => 0,
-        log::LevelFilter::Debug => 1,
-        log::LevelFilter::Info => 2,
-        log::LevelFilter::Warn => 3,
-        log::LevelFilter::Error => 4,
-        log::LevelFilter::Off => 5,
-    }
-}
-
-fn u8_to_level(val: u8) -> log::LevelFilter {
-    match val {
-        0 => log::LevelFilter::Trace,
-        1 => log::LevelFilter::Debug,
-        2 => log::LevelFilter::Info,
-        3 => log::LevelFilter::Warn,
-        4 => log::LevelFilter::Error,
-        _ => log::LevelFilter::Off,
     }
 }
 
@@ -153,11 +149,21 @@ fn u8_to_level(val: u8) -> log::LevelFilter {
 /// Typically constructed via [`LogWriterBuilder`].
 pub struct LogWriter {
     writer: RollingWriter,
-    level: Arc<AtomicU8>,
+    level: Arc<std::sync::atomic::AtomicU8>,
     timezone: Timezone,
 }
 
 impl LogWriter {
+    /// Initialize the global logger with default settings (rotation: Daily, level: Info).
+    ///
+    /// This is a convenience method for the most common use case.
+    /// Use [`builder`](Self::builder) for full configuration options.
+    ///
+    /// Returns a [`LogHandle`] for dynamic level changes at runtime.
+    pub fn init<P: AsRef<Path>>(path: P) -> io::Result<LogHandle> {
+        LogWriterBuilder::new(path).init()
+    }
+
     /// Create a new builder for the given log file path.
     pub fn builder<P: AsRef<Path>>(path: P) -> LogWriterBuilder {
         LogWriterBuilder::new(path)
@@ -175,13 +181,14 @@ impl LogWriter {
 
     /// Get the current log level.
     pub fn max_level(&self) -> log::LevelFilter {
-        u8_to_level(self.level.load(Ordering::Relaxed))
+        handle::u8_to_level(self.level.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
 impl log::Log for LogWriter {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= u8_to_level(self.level.load(Ordering::Relaxed))
+        metadata.level()
+            <= handle::u8_to_level(self.level.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -218,27 +225,6 @@ impl log::Log for LogWriter {
     }
 }
 
-/// A handle to dynamically change the log level of a [`LogWriter`].
-///
-/// This handle is backed by an `Arc<AtomicU8>`, so it is `Clone + Send + Sync`.
-/// You can clone it and move the clone to other threads for runtime level changes.
-#[derive(Clone)]
-pub struct LogHandle {
-    level: Arc<AtomicU8>,
-}
-
-impl LogHandle {
-    /// Set the log level.
-    pub fn set_level(&self, level: log::LevelFilter) {
-        self.level.store(level_to_u8(level), Ordering::Relaxed);
-    }
-
-    /// Get the current log level.
-    pub fn get_level(&self) -> log::LevelFilter {
-        u8_to_level(self.level.load(Ordering::Relaxed))
-    }
-}
-
 /// Initialize the global logger with a [`LogWriter`].
 ///
 /// Sets the given writer as the global logger. The initial log level
@@ -260,7 +246,7 @@ pub(crate) fn init(writer: LogWriter) -> io::Result<LogHandle> {
     log::set_boxed_logger(boxed).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     // Ensure the level stored in the writer matches what we set globally.
-    level.store(level_to_u8(initial_level), Ordering::Relaxed);
+    level.store(handle::level_to_u8(initial_level), std::sync::atomic::Ordering::Relaxed);
 
     Ok(LogHandle { level })
 }
@@ -353,6 +339,100 @@ mod tests {
         // Verify clone shares the same level.
         handle2.set_level(log::LevelFilter::Debug);
         assert_eq!(handle.get_level(), log::LevelFilter::Debug);
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_writes_from_threads() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = Arc::new(
+            LogWriterBuilder::new(&path)
+                .rotation(Rotation::Never)
+                .level(log::LevelFilter::Debug)
+                .build()?,
+        );
+
+        let mut jhs = Vec::new();
+        for i in 0..8 {
+            let w = writer.clone();
+            jhs.push(std::thread::spawn(move || {
+                for j in 0..50 {
+                    w.log(
+                        &log::Record::builder()
+                            .level(log::Level::Info)
+                            .target("test")
+                            .args(format_args!("thread-{i}-msg-{j}"))
+                            .build(),
+                    );
+                }
+                w.flush();
+            }));
+        }
+        for jh in jhs {
+            jh.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        // 8 threads * 50 messages = 400 lines
+        assert_eq!(lines.len(), 400, "expected 400 lines, got {}", lines.len());
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_level_change_during_writes() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.log");
+        let writer = Arc::new(
+            LogWriterBuilder::new(&path)
+                .rotation(Rotation::Never)
+                .level(log::LevelFilter::Info)
+                .build()?,
+        );
+        let handle = writer.handle();
+
+        // Writer threads: log at all levels
+        let mut wjhs = Vec::new();
+        for i in 0..4 {
+            let w = writer.clone();
+            wjhs.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    // Log at Info level so it's always accepted (min level is Info).
+                    w.log(
+                        &log::Record::builder()
+                            .level(log::Level::Info)
+                            .target("test")
+                            .args(format_args!("msg-{i}"))
+                            .build(),
+                    );
+                    std::thread::yield_now();
+                }
+                w.flush();
+            }));
+        }
+
+        // Level changer thread: toggle between Info and Debug
+        let h = handle.clone();
+        let ljh = std::thread::spawn(move || {
+            for _ in 0..100 {
+                h.set_level(log::LevelFilter::Debug);
+                std::thread::yield_now();
+                h.set_level(log::LevelFilter::Info);
+                std::thread::yield_now();
+            }
+        });
+
+        for jh in wjhs {
+            jh.join().unwrap();
+        }
+        ljh.join().unwrap();
+
+        // Verify no panic/drop issues: the file exists and has some content.
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path)?;
+        // At least Info-level messages should be present regardless of level toggling
+        assert!(!content.is_empty());
         Ok(())
     }
 }

@@ -11,7 +11,9 @@
 //! used directly with `tracing_appender::non_blocking()` for non-blocking
 //! writes, or with the `log_layer` module for `log` crate integration.
 
-use crate::config::{Compression, Rotation, RotationConfig, Timezone};
+use crate::config::{Rotation, RotationConfig, Timezone};
+#[cfg(feature = "compression")]
+use crate::config::Compression;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -87,39 +89,39 @@ impl RollingWriter {
         }
 
         // Compress and prune in the background thread, after compression.
+        #[cfg(feature = "compression")]
         if config.compression == Compression::Gzip {
-            #[cfg(feature = "compression")]
-            {
-                let gz_path = PathBuf::from(format!("{}.gz", rotated_path.display()));
-                let rotated_clone = rotated_path.clone();
-                let base_path_clone = path.clone();
-                let max_files = config.max_files;
-                let prune_config = config.clone();
-                std::thread::Builder::new()
-                    .spawn(move || {
-                        match compress_file(&rotated_clone, &gz_path) {
-                            Ok(_) => {
-                                let _ = fs::remove_file(&rotated_clone);
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                                // Already pruned by another rotation.
-                            }
-                            Err(_) => {}
+            let gz_path = PathBuf::from(format!("{}.gz", rotated_path.display()));
+            let rotated_clone = rotated_path.clone();
+            let base_path_clone = path.clone();
+            let max_files = config.max_files;
+            let prune_config = config.clone();
+            std::thread::Builder::new()
+                .spawn(move || {
+                    match compress_file(&rotated_clone, &gz_path) {
+                        Ok(_) => {
+                            let _ = fs::remove_file(&rotated_clone);
                         }
-                        // Prune AFTER compression completes, so .gz files are
-                        // visible and deduplication works correctly.
-                        if let Some(max) = max_files {
-                            prune_old_files(&base_path_clone, max, &prune_config);
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            // Already pruned by another rotation.
                         }
-                    })
-                    .ok();
-            }
-            #[cfg(not(feature = "compression"))]
-            {
-                let _ = rotated_path;
-            }
+                        Err(_) => {}
+                    }
+                    // Prune AFTER compression completes, so .gz files are
+                    // visible and deduplication works correctly.
+                    if let Some(max) = max_files {
+                        prune_old_files(&base_path_clone, max, &prune_config);
+                    }
+                })
+                .ok();
         } else if let Some(max) = config.max_files {
             // No compression: prune immediately.
+            prune_old_files(&path, max, &config);
+        }
+
+        #[cfg(not(feature = "compression"))]
+        if let Some(max) = config.max_files {
+            // No compression available: prune immediately.
             prune_old_files(&path, max, &config);
         }
 
@@ -235,7 +237,8 @@ impl RollingWriterBuilder {
         self
     }
 
-    /// Set the compression mode for rotated files.
+    /// Set the compression mode for rotated files (requires the `compression` feature).
+    #[cfg(feature = "compression")]
     pub fn compression(mut self, compression: Compression) -> Self {
         self.config.compression = compression;
         self
@@ -433,6 +436,14 @@ mod tests {
     fn test_unique_names_on_rapid_rotation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.log");
+        #[cfg(feature = "compression")]
+        let mut writer = RollingWriterBuilder::new(&path)
+            .max_file_size(1)
+            .rotation(Rotation::Never)
+            .compression(Compression::None)
+            .build()
+            .unwrap();
+        #[cfg(not(feature = "compression"))]
         let mut writer = RollingWriterBuilder::new(&path)
             .max_file_size(1)
             .rotation(Rotation::Never)
