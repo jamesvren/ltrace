@@ -11,9 +11,9 @@
 //! used directly with `tracing_appender::non_blocking()` for non-blocking
 //! writes, or with the `log_layer` module for `log` crate integration.
 
-use crate::config::{Rotation, RotationConfig, Timezone};
 #[cfg(feature = "compression")]
 use crate::config::Compression;
+use crate::config::{Rotation, RotationConfig, Timezone};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -56,6 +56,7 @@ impl RollingWriter {
         let inner = self.inner();
         let path = inner.base_path.clone();
         let config = inner.config.clone();
+        drop(inner);
 
         // Determine the timestamp suffix for the rotated file.
         // Use nanoseconds since UNIX epoch (monotonically increasing) instead of
@@ -77,8 +78,22 @@ impl RollingWriter {
             timestamp
         ));
 
-        drop(inner);
-
+        // When max_files is Some(0), the user doesn't want any rotated files kept.
+        // Skip the rename entirely and just truncate the current file in place.
+        // This avoids creating temporary rotated or compressed files.
+        let keep_archives = config.max_files.map_or(true, |max| max > 0);
+        if !keep_archives {
+            let new_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)?;
+            let mut inner = self.inner();
+            inner.current_file = new_file;
+            inner.current_size = 0;
+            inner.next_time_rotation = config.rotation.next_rotation(config.timezone.now());
+            return Ok(());
+        }
         // Rename the current file to the rotated path.
         if let Err(e) = fs::rename(&path, &rotated_path) {
             if e.kind() == io::ErrorKind::NotFound {
