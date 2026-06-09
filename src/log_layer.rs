@@ -129,9 +129,9 @@ impl LogWriterBuilder {
         }
         let rolling = builder.build()?;
 
-        let level = Arc::new(std::sync::atomic::AtomicU8::new(
-            handle::level_to_u8(self.level),
-        ));
+        let level = Arc::new(std::sync::atomic::AtomicU8::new(handle::level_to_u8(
+            self.level,
+        )));
 
         Ok(LogWriter {
             writer: rolling,
@@ -210,7 +210,7 @@ impl log::Log for LogWriter {
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
         let line = format!(
-            "{} {} {} {}\n",
+            "{} {} {} {}\r\n",
             timestamp,
             level,
             record.target(),
@@ -246,7 +246,10 @@ pub(crate) fn init(writer: LogWriter) -> io::Result<LogHandle> {
     log::set_boxed_logger(boxed).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     // Ensure the level stored in the writer matches what we set globally.
-    level.store(handle::level_to_u8(initial_level), std::sync::atomic::Ordering::Relaxed);
+    level.store(
+        handle::level_to_u8(initial_level),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     Ok(LogHandle { level })
 }
